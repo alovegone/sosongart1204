@@ -1,0 +1,1443 @@
+
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import Node from './components/Node';
+import Toolbar from './components/Toolbar';
+import TextToolbar from './components/TextToolbar';
+import ShapeToolbar from './components/ShapeToolbar';
+import LayersPanel from './components/LayersPanel';
+import PenToolbar from './components/PenToolbar';
+import { IconMinus, IconPlus, IconGrid, IconLayers } from './components/Icons';
+import { CanvasNode, NodeType, Point, Tool, ViewState } from './types';
+import { INITIAL_NODES, COLORS, INITIAL_SCALE, MIN_SCALE, MAX_SCALE } from './constants';
+
+const generateId = () => Math.random().toString(36).substr(2, 9);
+const SIDEBAR_WIDTH = 240;
+
+interface ResizeState {
+    isResizing: boolean;
+    nodeId: string;
+    handle: string;
+    startPoint: Point;
+    startDims: { width: number; height: number; x: number; y: number; fontSize: number };
+}
+
+// Selection Box Component
+const SelectionBox = ({ rect }: { rect: { x: number, y: number, width: number, height: number } }) => (
+  <div
+    className="absolute border border-indigo-500 bg-indigo-500/10 pointer-events-none z-50"
+    style={{
+      left: rect.x,
+      top: rect.y,
+      width: rect.width,
+      height: rect.height
+    }}
+  />
+);
+
+function App() {
+  const [nodes, setNodes] = useState<CanvasNode[]>(INITIAL_NODES as any[]);
+  const [view, setView] = useState<ViewState>({ scale: INITIAL_SCALE, offsetX: window.innerWidth / 2, offsetY: window.innerHeight / 2 });
+  const [activeTool, setActiveTool] = useState<Tool>('select');
+  
+  // Multi-selection State
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  
+  const [isLayersOpen, setIsLayersOpen] = useState(false);
+  
+  // Interaction State
+  const [isDragging, setIsDragging] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [resizeState, setResizeState] = useState<ResizeState | null>(null);
+  
+  // Box Selection State
+  const [isBoxSelecting, setIsBoxSelecting] = useState(false);
+  const [boxStart, setBoxStart] = useState<Point>({ x: 0, y: 0 });
+  const [selectionBox, setSelectionBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
+  
+  const [dragStart, setDragStart] = useState<Point>({ x: 0, y: 0 });
+  const [drawingStart, setDrawingStart] = useState<Point>({ x: 0, y: 0 });
+
+  // Pen Tool State
+  const [penPoints, setPenPoints] = useState<Point[]>([]);
+  const [currentPointerPos, setCurrentPointerPos] = useState<Point | null>(null);
+  const [isPenDragging, setIsPenDragging] = useState(false);
+  const [activePenPointIndex, setActivePenPointIndex] = useState<number | null>(null);
+  const [penPointMode, setPenPointMode] = useState<'corner' | 'smooth'>('corner');
+  const [editingPathId, setEditingPathId] = useState<string | null>(null);
+  const [editingNodeId, setEditingNodeId] = useState<string | null>(null);
+  const [activePathAnchor, setActivePathAnchor] = useState<{ nodeId: string, index: number } | null>(null);
+  const [pendingImages, setPendingImages] = useState<{ src: string, width: number, height: number }[]>([]);
+  const [pendingImagePos, setPendingImagePos] = useState<Point | null>(null);
+  const [snapEnabled, setSnapEnabled] = useState(false);
+  const [snapGuides, setSnapGuides] = useState<{ vertical: { x: number, y1: number, y2: number }[], horizontal: { y: number, x1: number, x2: number }[] }>({ vertical: [], horizontal: [] });
+  const PENDING_SPACING = 16;
+  const SNAP_TOLERANCE = 8;
+  const [croppingImageId, setCroppingImageId] = useState<string | null>(null);
+  const [alignMenuOpen, setAlignMenuOpen] = useState(false);
+  const [spacingMenuOpen, setSpacingMenuOpen] = useState(false);
+
+  const [boardName, setBoardName] = useState("Untitled Board");
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
+
+  // Global Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      // Skip if typing in an input field
+      if (['INPUT', 'TEXTAREA'].includes(target.tagName) || target.isContentEditable) {
+        return;
+      }
+
+      if (e.key === 'Backspace' || e.key === 'Delete') {
+        if (selectedNodeIds.length > 0) {
+          setNodes(prev => prev.filter(node => !selectedNodeIds.includes(node.id)));
+          setSelectedNodeIds([]);
+        }
+      }
+      
+      // Cancel Pen Drawing
+      if (e.key === 'Escape') {
+          if (activeTool === 'pen') {
+              setPenPoints([]);
+              setActivePenPointIndex(null);
+          }
+      }
+      
+      // Enter to finish path
+      if (e.key === 'Enter' && activeTool === 'pen' && penPoints.length > 1) {
+          finishPenPath(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedNodeIds, activeTool, penPoints]);
+
+  useEffect(() => {
+    if (activeTool !== 'pen') {
+        setPenPoints([]);
+        setCurrentPointerPos(null);
+        setIsPenDragging(false);
+        setActivePenPointIndex(null);
+        if (activeTool !== 'select') {
+            setEditingNodeId(null);
+        }
+    }
+  }, [activeTool]);
+
+  useEffect(() => {
+    if (activeTool === 'pen') {
+        // If a path is selected, enter edit mode automatically
+        const lastSelected = selectedNodeIds.length > 0 ? nodes.find(n => n.id === selectedNodeIds[selectedNodeIds.length - 1]) : null;
+        if (lastSelected && lastSelected.type === 'path') {
+            setEditingPathId(lastSelected.id);
+            setEditingNodeId(lastSelected.id);
+            if (!activePathAnchor && lastSelected.points && lastSelected.points.length > 0) {
+                setActivePathAnchor({ nodeId: lastSelected.id, index: 0 });
+            }
+        }
+    } else {
+        setEditingPathId(null);
+        setActivePathAnchor(null);
+    }
+  }, [activeTool, selectedNodeIds]);
+
+  useEffect(() => {
+    if (activePathAnchor && !selectedNodeIds.includes(activePathAnchor.nodeId)) {
+        setActivePathAnchor(null);
+    }
+  }, [selectedNodeIds, activePathAnchor]);
+
+  useEffect(() => {
+    if (croppingImageId && !selectedNodeIds.includes(croppingImageId)) {
+        setCroppingImageId(null);
+    }
+  }, [croppingImageId, selectedNodeIds]);
+
+  const screenToWorld = useCallback((screenX: number, screenY: number): Point => {
+    return {
+      x: (screenX - view.offsetX) / view.scale,
+      y: (screenY - view.offsetY) / view.scale,
+    };
+  }, [view]);
+
+  const worldToScreen = useCallback((worldX: number, worldY: number): Point => {
+    return {
+        x: worldX * view.scale + view.offsetX,
+        y: worldY * view.scale + view.offsetY
+    };
+  }, [view]);
+
+  const finishPenPath = (forceClose?: boolean) => {
+        if (penPoints.length < 2) {
+            setPenPoints([]);
+            setActivePenPointIndex(null);
+            setIsPenDragging(false);
+            return;
+        }
+        
+        const xs = penPoints.map(p => p.x);
+        const ys = penPoints.map(p => p.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        // Ensure non-zero width/height
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+
+        const shouldClose = forceClose === true;
+
+        const id = generateId();
+        const newNode: CanvasNode = {
+            id,
+            type: 'path',
+            x: minX,
+            y: minY,
+            width,
+            height,
+            content: '',
+            color: '#ffffff',
+            fillColor: '#dbeafe',
+            strokeColor: '#3b82f6',
+            strokeWidth: 2,
+            closed: shouldClose,
+            // Normalize points AND their handles to 0-1 range relative to bounding box
+            points: penPoints.map(p => ({
+                x: (p.x - minX) / width,
+                y: (p.y - minY) / height,
+                lcx: p.lcx ? p.lcx / width : undefined,
+                lcy: p.lcy ? p.lcy / height : undefined,
+                rcx: p.rcx ? p.rcx / width : undefined,
+                rcy: p.rcy ? p.rcy / height : undefined,
+            }))
+        };
+        
+        setNodes(prev => [...prev, newNode]);
+        setSelectedNodeIds([id]);
+        setEditingPathId(id);
+        setActivePathAnchor({ nodeId: id, index: penPoints.length - 1 });
+        setPenPoints([]);
+        setActivePenPointIndex(null);
+        setIsPenDragging(false);
+  };
+
+  const computeSnap = (dx: number, dy: number) => {
+      if (!snapEnabled || selectedNodeIds.length === 0) return { dx: 0, dy: 0, guides: { vertical: [], horizontal: [] } };
+
+      const movingIds = new Set(selectedNodeIds);
+      const moving = nodes.filter(n => movingIds.has(n.id));
+      if (moving.length === 0) return { dx: 0, dy: 0, guides: { vertical: [], horizontal: [] } };
+
+      const others = nodes.filter(n => !movingIds.has(n.id));
+      if (others.length === 0) return { dx: 0, dy: 0, guides: { vertical: [], horizontal: [] } };
+
+      const tolerance = SNAP_TOLERANCE / view.scale;
+
+      const movedBounds = (() => {
+          const xs = moving.flatMap(n => [n.x + dx, n.x + n.width + dx]);
+          const ys = moving.flatMap(n => [n.y + dy, n.y + n.height + dy]);
+          const minX = Math.min(...xs);
+          const maxX = Math.max(...xs);
+          const minY = Math.min(...ys);
+          const maxY = Math.max(...ys);
+          return {
+              left: minX,
+              right: maxX,
+              top: minY,
+              bottom: maxY,
+              centerX: (minX + maxX) / 2,
+              centerY: (minY + maxY) / 2
+          };
+      })();
+
+      const movingTargetsX = [
+        { pos: movedBounds.left, span: [movedBounds.top, movedBounds.bottom] },
+        { pos: movedBounds.centerX, span: [movedBounds.top, movedBounds.bottom] },
+        { pos: movedBounds.right, span: [movedBounds.top, movedBounds.bottom] },
+      ];
+      const movingTargetsY = [
+        { pos: movedBounds.top, span: [movedBounds.left, movedBounds.right] },
+        { pos: movedBounds.centerY, span: [movedBounds.left, movedBounds.right] },
+        { pos: movedBounds.bottom, span: [movedBounds.left, movedBounds.right] },
+      ];
+
+      const candidateX: { pos: number, span: [number, number] }[] = [];
+      const candidateY: { pos: number, span: [number, number] }[] = [];
+      others.forEach(n => {
+          candidateX.push(
+              { pos: n.x, span: [n.y, n.y + n.height] },
+              { pos: n.x + n.width, span: [n.y, n.y + n.height] },
+              { pos: n.x + n.width / 2, span: [n.y, n.y + n.height] },
+          );
+          candidateY.push(
+              { pos: n.y, span: [n.x, n.x + n.width] },
+              { pos: n.y + n.height, span: [n.x, n.x + n.width] },
+              { pos: n.y + n.height / 2, span: [n.x, n.x + n.width] },
+          );
+      });
+
+      // Canvas center as soft guide
+      const canvasCenterX = (window.innerWidth - view.offsetX) / view.scale;
+      const canvasCenterY = (window.innerHeight - view.offsetY) / view.scale;
+      candidateX.push({ pos: canvasCenterX, span: [movedBounds.top, movedBounds.bottom] });
+      candidateY.push({ pos: canvasCenterY, span: [movedBounds.left, movedBounds.right] });
+
+      let bestDx = 0;
+      let bestDy = 0;
+      let bestX: { pos: number, span: [number, number] } | null = null;
+      let bestY: { pos: number, span: [number, number] } | null = null;
+      let bestXDist = Infinity;
+      let bestYDist = Infinity;
+
+      for (const t of movingTargetsX) {
+          for (const c of candidateX) {
+              const dist = Math.abs(c.pos - t.pos);
+              if (dist <= tolerance && dist < bestXDist) {
+                  bestXDist = dist;
+                  bestDx = c.pos - t.pos;
+                  bestX = { pos: c.pos, span: [Math.min(c.span[0], t.span[0]), Math.max(c.span[1], t.span[1])] };
+              }
+          }
+      }
+
+      for (const t of movingTargetsY) {
+          for (const c of candidateY) {
+              const dist = Math.abs(c.pos - t.pos);
+              if (dist <= tolerance && dist < bestYDist) {
+                  bestYDist = dist;
+                  bestDy = c.pos - t.pos;
+                  bestY = { pos: c.pos, span: [Math.min(c.span[0], t.span[0]), Math.max(c.span[1], t.span[1])] };
+              }
+          }
+      }
+
+      const guides: { vertical: { x: number, y1: number, y2: number }[], horizontal: { y: number, x1: number, x2: number }[] } = { vertical: [], horizontal: [] };
+      if (bestX) guides.vertical.push({ x: bestX.pos, y1: bestX.span[0], y2: bestX.span[1] });
+      if (bestY) guides.horizontal.push({ y: bestY.pos, x1: bestY.span[0], x2: bestY.span[1] });
+
+      // Equal spacing (requires at least 2 neighbors)
+      if (others.length >= 2) {
+          const movedWidth = movedBounds.right - movedBounds.left;
+          const movedHeight = movedBounds.bottom - movedBounds.top;
+
+          const horizontalNeighbors = [...others].sort((a, b) => a.x - b.x);
+          for (let i = 0; i < horizontalNeighbors.length - 1; i++) {
+              const left = horizontalNeighbors[i];
+              const right = horizontalNeighbors[i + 1];
+              const gap = right.x - (left.x + left.width);
+              if (gap <= 0) continue;
+              const desiredLeft = left.x + left.width + gap;
+              const spacingDx = desiredLeft - movedBounds.left;
+              const dist = Math.abs(spacingDx);
+              if (dist <= tolerance && dist < bestXDist) {
+                  bestXDist = dist;
+                  bestDx = spacingDx;
+                  guides.vertical = [
+                    { x: desiredLeft, y1: Math.min(left.y, movedBounds.top), y2: Math.max(left.y + left.height, movedBounds.bottom) },
+                    { x: desiredLeft + movedWidth, y1: Math.min(right.y, movedBounds.top), y2: Math.max(right.y + right.height, movedBounds.bottom) },
+                  ];
+              }
+          }
+
+          const verticalNeighbors = [...others].sort((a, b) => a.y - b.y);
+          for (let i = 0; i < verticalNeighbors.length - 1; i++) {
+              const top = verticalNeighbors[i];
+              const bottom = verticalNeighbors[i + 1];
+              const gap = bottom.y - (top.y + top.height);
+              if (gap <= 0) continue;
+              const desiredTop = top.y + top.height + gap;
+              const spacingDy = desiredTop - movedBounds.top;
+              const dist = Math.abs(spacingDy);
+              if (dist <= tolerance && dist < bestYDist) {
+                  bestYDist = dist;
+                  bestDy = spacingDy;
+                  guides.horizontal = [
+                    { y: desiredTop, x1: Math.min(top.x, movedBounds.left), x2: Math.max(top.x + top.width, movedBounds.right) },
+                    { y: desiredTop + movedHeight, x1: Math.min(bottom.x, movedBounds.left), x2: Math.max(bottom.x + bottom.width, movedBounds.right) },
+                  ];
+              }
+          }
+      }
+
+      return { dx: bestDx, dy: bestDy, guides };
+  };
+
+  const handleGroup = () => {
+      if (selectedNodeIds.length < 2) return;
+      const gid = `grp_${generateId()}`;
+      setNodes(prev => prev.map(n => selectedNodeIds.includes(n.id) ? { ...n, groupId: gid } : n));
+  };
+
+  const handleUngroup = () => {
+      if (selectedNodeIds.length === 0) return;
+      setNodes(prev => prev.map(n => selectedNodeIds.includes(n.id) ? { ...n, groupId: undefined } : n));
+  };
+
+  const alignNodes = (type: 'left' | 'centerX' | 'right' | 'top' | 'centerY' | 'bottom') => {
+      if (selectedNodeIds.length < 2) return;
+      const selected = nodes.filter(n => selectedNodeIds.includes(n.id));
+      const minX = Math.min(...selected.map(n => n.x));
+      const maxX = Math.max(...selected.map(n => n.x + n.width));
+      const minY = Math.min(...selected.map(n => n.y));
+      const maxY = Math.max(...selected.map(n => n.y + n.height));
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+
+      setNodes(prev => prev.map(n => {
+          if (!selectedNodeIds.includes(n.id)) return n;
+          if (type === 'left') return { ...n, x: minX };
+          if (type === 'right') return { ...n, x: maxX - n.width };
+          if (type === 'centerX') return { ...n, x: centerX - n.width / 2 };
+          if (type === 'top') return { ...n, y: minY };
+          if (type === 'bottom') return { ...n, y: maxY - n.height };
+          if (type === 'centerY') return { ...n, y: centerY - n.height / 2 };
+          return n;
+      }));
+  };
+
+  const distribute = (axis: 'x' | 'y') => {
+      if (selectedNodeIds.length < 3) return;
+      const ordered = nodes.filter(n => selectedNodeIds.includes(n.id)).sort((a, b) => axis === 'x' ? a.x - b.x : a.y - b.y);
+      const first = ordered[0];
+      const last = ordered[ordered.length - 1];
+      const totalSpan = axis === 'x'
+          ? (last.x + last.width) - first.x
+          : (last.y + last.height) - first.y;
+      const sizes = axis === 'x'
+          ? ordered.reduce((s, n) => s + n.width, 0)
+          : ordered.reduce((s, n) => s + n.height, 0);
+      const gap = (totalSpan - sizes) / (ordered.length - 1);
+
+      const newPos: Record<string, number> = {};
+      let cursor = axis === 'x' ? first.x : first.y;
+      ordered.forEach(n => {
+          newPos[n.id] = cursor;
+          cursor += (axis === 'x' ? n.width : n.height) + gap;
+      });
+
+      setNodes(prev => prev.map(n => {
+          if (!selectedNodeIds.includes(n.id)) return n;
+          return axis === 'x' ? { ...n, x: newPos[n.id] } : { ...n, y: newPos[n.id] };
+      }));
+  };
+
+  const toggleCropSelectedImage = () => {
+      if (selectedNodeIds.length !== 1) return;
+      const node = nodes.find(n => n.id === selectedNodeIds[0] && n.type === 'image');
+      if (!node) return;
+      if (croppingImageId === node.id) {
+          setCroppingImageId(null);
+          setNodes(prev => prev.map(n => n.id === node.id ? { ...n, aspectRatioLocked: true } : n));
+      } else {
+          setCroppingImageId(node.id);
+          setNodes(prev => prev.map(n => n.id === node.id ? { ...n, aspectRatioLocked: false, cropX: n.cropX ?? 0, cropY: n.cropY ?? 0, cropScale: n.cropScale ?? 1 } : n));
+      }
+  };
+
+  const bringToFront = () => {
+      if (selectedNodeIds.length === 0) return;
+      const selectedSet = new Set(selectedNodeIds);
+      setNodes(prev => {
+          const picked = prev.filter(n => selectedSet.has(n.id));
+          const others = prev.filter(n => !selectedSet.has(n.id));
+          return [...others, ...picked];
+      });
+  };
+
+  const sendToBack = () => {
+      if (selectedNodeIds.length === 0) return;
+      const selectedSet = new Set(selectedNodeIds);
+      setNodes(prev => {
+          const picked = prev.filter(n => selectedSet.has(n.id));
+          const others = prev.filter(n => !selectedSet.has(n.id));
+          return [...picked, ...others];
+      });
+  };
+
+  const findFreeOrigin = (center: Point, totalW: number, totalH: number) => {
+      const inflate = 16; // padding from existing nodes
+      const start = { x: center.x - totalW / 2, y: center.y - totalH / 2 };
+
+      const intersects = (ox: number, oy: number) => {
+          const ax1 = ox, ay1 = oy, ax2 = ox + totalW, ay2 = oy + totalH;
+          return nodes.some(n => {
+              const bx1 = n.x - inflate;
+              const by1 = n.y - inflate;
+              const bx2 = n.x + n.width + inflate;
+              const by2 = n.y + n.height + inflate;
+              return !(ax2 <= bx1 || ax1 >= bx2 || ay2 <= by1 || ay1 >= by2);
+          });
+      };
+
+      if (!intersects(start.x, start.y)) return start;
+
+      const step = Math.max(32, Math.min(120, Math.max(totalW, totalH) / 2));
+      const maxIter = 30;
+      for (let i = 1; i <= maxIter; i++) {
+          const dist = step * i;
+          const candidates = [
+              [start.x + dist, start.y],
+              [start.x - dist, start.y],
+              [start.x, start.y + dist],
+              [start.x, start.y - dist],
+              [start.x + dist, start.y + dist],
+              [start.x - dist, start.y + dist],
+              [start.x + dist, start.y - dist],
+              [start.x - dist, start.y - dist],
+          ];
+          for (const [ox, oy] of candidates) {
+              if (!intersects(ox, oy)) return { x: ox, y: oy };
+          }
+      }
+
+      return start;
+  };
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.target === canvasRef.current && isLayersOpen) {
+        setIsLayersOpen(false);
+    }
+
+    // If there are pending uploads, place ALL images at the click point in a grid
+    if (pendingImages.length > 0 && e.target === canvasRef.current) {
+        e.stopPropagation();
+        const worldPos = screenToWorld(e.clientX, e.clientY);
+
+        const count = pendingImages.length;
+        const cols = Math.ceil(Math.sqrt(count));
+        const rows = Math.ceil(count / cols);
+
+        const colWidths = Array(cols).fill(0);
+        const rowHeights = Array(rows).fill(0);
+        pendingImages.forEach((img, idx) => {
+            const r = Math.floor(idx / cols);
+            const c = idx % cols;
+            colWidths[c] = Math.max(colWidths[c], img.width);
+            rowHeights[r] = Math.max(rowHeights[r], img.height);
+        });
+
+        const totalWidth = colWidths.reduce((a, w) => a + w, 0) + PENDING_SPACING * (cols - 1);
+        const totalHeight = rowHeights.reduce((a, h) => a + h, 0) + PENDING_SPACING * (rows - 1);
+        const origin = findFreeOrigin(worldPos, totalWidth, totalHeight);
+        const originX = origin.x;
+        const originY = origin.y;
+
+        const newNodes: CanvasNode[] = [];
+        let y = originY;
+        for (let r = 0; r < rows; r++) {
+            let x = originX;
+            for (let c = 0; c < cols; c++) {
+                const idx = r * cols + c;
+                const img = pendingImages[idx];
+                if (!img) { x += (colWidths[c] || 0) + PENDING_SPACING; continue; }
+                const id = generateId();
+                newNodes.push({
+                    id,
+                    type: 'image',
+                    x: x + (colWidths[c] - img.width) / 2,
+                    y: y + (rowHeights[r] - img.height) / 2,
+                    width: img.width,
+                    height: img.height,
+                    content: '',
+                    color: '#ffffff',
+                    aspectRatioLocked: true,
+                    src: img.src
+                });
+                x += (colWidths[c] || 0) + PENDING_SPACING;
+            }
+            y += (rowHeights[r] || 0) + PENDING_SPACING;
+        }
+
+        setNodes(prev => [...prev, ...newNodes]);
+        setSelectedNodeIds(newNodes.map(n => n.id));
+        setPendingImages([]);
+        setPendingImagePos(null);
+        setActiveTool('select');
+        return;
+    }
+
+    if (activeTool === 'select' && e.target === canvasRef.current) {
+        setEditingPathId(null);
+        setEditingNodeId(null);
+        setActivePathAnchor(null);
+    }
+
+    const worldPos = screenToWorld(e.clientX, e.clientY);
+
+    // 1. Panning (Middle Mouse OR Hand Tool)
+    if (activeTool === 'hand' || e.button === 1) {
+      setIsPanning(true);
+      setDragStart({ x: e.clientX, y: e.clientY });
+      return;
+    }
+
+    // 2. Pen Tool (Advanced)
+    if (activeTool === 'pen') {
+        e.stopPropagation();
+
+        // If editing an existing path, avoid starting a new one from blank canvas
+        if (editingPathId) {
+            return;
+        }
+        
+        // Right click (or long-press via context) ends open path without closing
+        if (e.button === 2) {
+            e.preventDefault();
+            finishPenPath(false);
+            return;
+        }
+
+        // Double click ends the current path without closing (Photoshop style)
+        if (e.detail === 2 && penPoints.length > 1) {
+            finishPenPath(false);
+            return;
+        }
+        
+        // A. Check if clicking start point to close
+        if (penPoints.length > 2) {
+            const start = penPoints[0];
+            const dist = Math.sqrt(Math.pow(worldPos.x - start.x, 2) + Math.pow(worldPos.y - start.y, 2));
+            const threshold = 10 / view.scale;
+
+            if (dist < threshold) {
+                finishPenPath(true);
+                return;
+            }
+        }
+        
+        // B. Add new point
+        const newPoint = { x: worldPos.x, y: worldPos.y };
+        setPenPoints(prev => [...prev, newPoint]);
+        setActivePenPointIndex(penPoints.length); // Index of the point we just added
+        setIsPenDragging(true); // Start drag mode immediately to allow handle creation
+        return;
+    }
+
+    // 3. Box Selection (Select Tool + Click on Canvas)
+    if (activeTool === 'select' && e.target === canvasRef.current) {
+        if (!e.shiftKey) {
+            setSelectedNodeIds([]); // Clear selection if not adding
+        }
+        setIsBoxSelecting(true);
+        setBoxStart(worldPos);
+        setSelectionBox({ x: worldPos.x, y: worldPos.y, width: 0, height: 0 });
+        return;
+    }
+
+    // 4. Creating New Nodes (Shapes, Text, etc.)
+    if (['rectangle', 'circle', 'triangle', 'star', 'diamond', 'hexagon', 'pentagon', 'arrow', 'line', 'pencil', 'text'].includes(activeTool)) {
+        if (editingNodeId) return; // Editing mode: do not create new nodes
+        setIsDrawing(true);
+        setDrawingStart(worldPos);
+        const id = generateId();
+        
+        let newNode: CanvasNode;
+        if (activeTool === 'text') {
+             newNode = {
+                id,
+                type: 'text',
+                x: worldPos.x,
+                y: worldPos.y - 30,
+                width: 200, height: 60,
+                content: '',
+                color: 'transparent',
+                fillColor: '#000000',
+                fontSize: 24,
+                fontFamily: 'Inter, sans-serif'
+             };
+             setNodes(prev => [...prev, newNode]);
+             setSelectedNodeIds([id]);
+             setActiveTool('select');
+             setIsDrawing(false);
+             return;
+        } else if (activeTool === 'pencil') {
+             newNode = {
+                id, type: 'draw', x: worldPos.x, y: worldPos.y, width: 0, height: 0, content: '', color: '#1e293b', points: [{ x: 0, y: 0 }]
+             };
+        } else if (activeTool === 'line' || activeTool === 'arrow') {
+             newNode = {
+                id, type: activeTool, x: worldPos.x, y: worldPos.y, width: 0, height: 0, content: '', color: '#64748b', points: [{ x: 0, y: 0 }, { x: 0, y: 0 }]
+             };
+        } else {
+            // Shapes default styling
+            newNode = {
+                id, 
+                type: activeTool as NodeType, 
+                x: worldPos.x, 
+                y: worldPos.y, 
+                width: 0, 
+                height: 0, 
+                content: '', 
+                color: '#ffffff', // Default white background
+                fillColor: '#dbeafe', // Default visible color (blue-100)
+                strokeColor: '#94a3b8',
+                strokeWidth: 1,
+                aspectRatioLocked: false
+            };
+        }
+
+        setNodes(prev => [...prev, newNode]);
+        setSelectedNodeIds([id]);
+    }
+  };
+
+  const handleResizeStart = (e: React.PointerEvent, handle: string, nodeId: string) => {
+      e.stopPropagation();
+      const node = nodes.find(n => n.id === nodeId);
+      if (node) {
+          setResizeState({
+              isResizing: true,
+              nodeId: node.id,
+              handle,
+              startPoint: screenToWorld(e.clientX, e.clientY),
+              startDims: { 
+                  width: node.width, 
+                  height: node.height, 
+                  x: node.x, 
+                  y: node.y,
+                  fontSize: node.fontSize || 16
+              }
+          });
+      }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const worldPos = screenToWorld(e.clientX, e.clientY);
+    
+    if (pendingImages.length > 0) {
+        setPendingImagePos(worldPos);
+    }
+
+    // Pen Tool Logic: Dragging creates handles
+    if (activeTool === 'pen') {
+        setCurrentPointerPos(worldPos);
+        
+        if (isPenDragging && activePenPointIndex !== null && penPoints[activePenPointIndex]) {
+            // Dragging to create bezier handles
+            // Current mouse pos is the Out handle (rc)
+            const anchor = penPoints[activePenPointIndex];
+            const dx = worldPos.x - anchor.x;
+            const dy = worldPos.y - anchor.y;
+
+            setPenPoints(prev => {
+                const copy = [...prev];
+                copy[activePenPointIndex] = {
+                    ...anchor,
+                    rcx: dx,
+                    rcy: dy,
+                    lcx: -dx, // Mirror for smooth join
+                    lcy: -dy
+                };
+                return copy;
+            });
+            return;
+        }
+    }
+
+    // 1. Resizing
+    if (resizeState) {
+        const dx = worldPos.x - resizeState.startPoint.x;
+        const dy = worldPos.y - resizeState.startPoint.y;
+        const { startDims, handle } = resizeState;
+        
+        setNodes(prev => prev.map(node => {
+            if (node.id !== resizeState.nodeId) return node;
+
+            let newWidth = startDims.width;
+            let newHeight = startDims.height;
+            let newX = startDims.x;
+            let newY = startDims.y;
+            let newFontSize = startDims.fontSize;
+
+            // Determine dimensions based on handle
+            if (handle.includes('e')) newWidth = startDims.width + dx;
+            if (handle.includes('w')) { newWidth = startDims.width - dx; newX = startDims.x + dx; }
+            if (handle.includes('s')) newHeight = startDims.height + dy;
+            if (handle.includes('n')) { newHeight = startDims.height - dy; newY = startDims.y + dy; }
+
+            // Apply Aspect Ratio Lock for Shapes/Images
+            if (node.aspectRatioLocked || node.type === 'image') {
+                const ratio = startDims.width / startDims.height;
+                if (handle.includes('e') || handle.includes('w')) {
+                    newHeight = newWidth / ratio;
+                    if (handle.includes('n')) newY = startDims.y + (startDims.height - newHeight);
+                } else {
+                    newWidth = newHeight * ratio;
+                    if (handle.includes('w')) newX = startDims.x + (startDims.width - newWidth);
+                }
+            }
+
+            // Special logic for Text Scaling
+            if (node.type === 'text') {
+                if (handle.length === 2) {
+                    const ratio = newWidth / startDims.width;
+                    newFontSize = Math.max(8, startDims.fontSize * ratio);
+                    newHeight = startDims.height * ratio; 
+                } else {
+                    newFontSize = startDims.fontSize; 
+                }
+            }
+
+            return {
+                ...node,
+                x: newX, y: newY,
+                width: Math.max(10, newWidth),
+                height: Math.max(10, newHeight),
+                fontSize: Math.round(newFontSize)
+            };
+        }));
+        return;
+    }
+
+    // 2. Panning
+    if (isPanning) {
+      const dx = e.clientX - dragStart.x;
+      const dy = e.clientY - dragStart.y;
+      setView(prev => ({ ...prev, offsetX: prev.offsetX + dx, offsetY: prev.offsetY + dy }));
+      setDragStart({ x: e.clientX, y: e.clientY });
+    } 
+    // 3. Drawing
+    else if (isDrawing && selectedNodeIds.length === 1) {
+        const activeId = selectedNodeIds[0];
+        setNodes(prev => prev.map(node => {
+            if (node.id !== activeId) return node;
+            if (node.type === 'draw') {
+                const newPoint = { x: worldPos.x - node.x, y: worldPos.y - node.y };
+                return { ...node, width: Math.max(node.width, newPoint.x), height: Math.max(node.height, newPoint.y), points: [...(node.points || []), newPoint] };
+            }
+            if (node.type === 'line' || node.type === 'arrow') {
+                return { ...node, points: [{ x: 0, y: 0 }, { x: worldPos.x - node.x, y: worldPos.y - node.y }] };
+            }
+            const dx = worldPos.x - drawingStart.x;
+            const dy = worldPos.y - drawingStart.y;
+            return {
+                ...node,
+                x: dx < 0 ? worldPos.x : drawingStart.x,
+                y: dy < 0 ? worldPos.y : drawingStart.y,
+                width: Math.abs(dx),
+                height: Math.abs(dy)
+            };
+        }));
+    }
+    // 4. Box Selection Updating
+    else if (isBoxSelecting) {
+        const x = Math.min(boxStart.x, worldPos.x);
+        const y = Math.min(boxStart.y, worldPos.y);
+        const width = Math.abs(worldPos.x - boxStart.x);
+        const height = Math.abs(worldPos.y - boxStart.y);
+        setSelectionBox({ x, y, width, height });
+    }
+    // 5. Dragging Node(s)
+  else if (isDragging && selectedNodeIds.length > 0) {
+      const dx = worldPos.x - dragStart.x;
+      const dy = worldPos.y - dragStart.y;
+
+      const snap = computeSnap(dx, dy);
+      const totalDx = dx + snap.dx;
+      const totalDy = dy + snap.dy;
+
+      setNodes(prev => prev.map(node => {
+        if (selectedNodeIds.includes(node.id)) {
+          return { ...node, x: node.x + totalDx, y: node.y + totalDy };
+        }
+        return node;
+      }));
+
+      if (snapEnabled) setSnapGuides(snap.guides); else setSnapGuides({ vertical: [], horizontal: [] });
+      setDragStart({ x: worldPos.x + snap.dx, y: worldPos.y + snap.dy });
+    }
+    else {
+        if (snapGuides.vertical.length || snapGuides.horizontal.length) {
+            setSnapGuides({ vertical: [], horizontal: [] });
+        }
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (activeTool === 'pen') {
+        setIsPenDragging(false);
+        // Do not reset activePenPointIndex here, user might just click again to continue path
+    }
+    setSnapGuides({ vertical: [], horizontal: [] });
+
+    if (isBoxSelecting && selectionBox) {
+        // Find intersecting nodes
+        const selected = nodes.filter(node => 
+            node.x < selectionBox.x + selectionBox.width &&
+            node.x + node.width > selectionBox.x &&
+            node.y < selectionBox.y + selectionBox.height &&
+            node.y + node.height > selectionBox.y
+        ).map(n => n.id);
+
+        setSelectedNodeIds(prev => {
+            if (e.shiftKey) {
+                // Add to selection (Union)
+                return Array.from(new Set([...prev, ...selected]));
+            }
+            return selected;
+        });
+        
+        setSelectionBox(null);
+        setIsBoxSelecting(false);
+    }
+
+    setResizeState(null);
+    setIsPanning(false);
+    setIsDragging(false);
+    setIsDrawing(false);
+    if (isDrawing && activeTool !== 'pencil') setActiveTool('select');
+  };
+
+  const handleNodePointerDown = (e: React.PointerEvent, nodeId: string) => {
+    e.stopPropagation();
+    const node = nodes.find(n => n.id === nodeId);
+    if (activeTool === 'pen' && node?.type === 'path') {
+        setSelectedNodeIds([nodeId]);
+        setEditingPathId(nodeId);
+        setEditingNodeId(nodeId);
+        if (node.points && node.points.length > 0) {
+            setActivePathAnchor({ nodeId, index: 0 });
+        }
+        setPenPoints([]);
+        setCurrentPointerPos(null);
+        setActivePenPointIndex(null);
+        return;
+    }
+    if (activeTool !== 'select') return;
+
+    // Group-aware selection
+    const groupIds = node?.groupId ? nodes.filter(n => n.groupId === node.groupId).map(n => n.id) : [];
+
+    // Multi-select Logic
+    if (e.shiftKey) {
+        if (selectedNodeIds.includes(nodeId)) {
+            setSelectedNodeIds(prev => prev.filter(id => id !== nodeId));
+            setIsDragging(false); // Don't drag if we just deselected
+            return;
+        } else {
+            if (groupIds.length > 0) {
+                setSelectedNodeIds(prev => Array.from(new Set([...prev, ...groupIds])));
+            } else {
+                setSelectedNodeIds(prev => [...prev, nodeId]);
+            }
+        }
+    } else {
+        if (groupIds.length > 0) {
+            setSelectedNodeIds(groupIds);
+        } else if (!selectedNodeIds.includes(nodeId)) {
+            setSelectedNodeIds([nodeId]);
+        }
+    }
+
+    setIsDragging(true);
+    // Set start point in World Coordinates for drag calculations
+    setDragStart(screenToWorld(e.clientX, e.clientY));
+  };
+
+  const updateNodeContent = (id: string, content: string) => {
+    setNodes(prev => prev.map(n => n.id === id ? { ...n, content } : n));
+  };
+
+  const updateNodeStyle = (updates: Partial<CanvasNode>) => {
+      if (selectedNodeIds.length > 0) {
+          setNodes(prev => prev.map(n => selectedNodeIds.includes(n.id) ? { ...n, ...updates } : n));
+      }
+  };
+  
+  const updateNodePoints = (id: string, updates: Partial<CanvasNode>) => {
+      setNodes(prev => prev.map(n => n.id === id ? { ...n, ...updates } : n));
+  };
+
+  const buildSmoothHandles = (points: Point[], index: number, isClosed: boolean): Partial<Point> => {
+      const p = points[index];
+      const prev = isClosed ? points[(index - 1 + points.length) % points.length] : points[index - 1];
+      const next = isClosed ? points[(index + 1) % points.length] : points[index + 1];
+
+      let dirX = 0;
+      let dirY = 0;
+
+      if (prev && next) {
+          dirX = next.x - prev.x;
+          dirY = next.y - prev.y;
+      } else if (next) {
+          dirX = next.x - p.x;
+          dirY = next.y - p.y;
+      } else if (prev) {
+          dirX = p.x - prev.x;
+          dirY = p.y - prev.y;
+      }
+
+      const len = Math.hypot(dirX, dirY) || 1;
+      const normX = dirX / len;
+      const normY = dirY / len;
+      const handleLength = 0.2; // relative to bounding box
+
+      return { lcx: -normX * handleLength, lcy: -normY * handleLength, rcx: normX * handleLength, rcy: normY * handleLength };
+  };
+
+  const handleSelectAnchor = (nodeId: string, index: number | null) => {
+      if (index === null) {
+          setActivePathAnchor(null);
+          return;
+      }
+      setActivePathAnchor({ nodeId, index });
+      setEditingPathId(nodeId);
+      // When selecting an anchor, sync toolbar mode to the anchor type
+      const node = nodes.find(n => n.id === nodeId);
+      if (node?.type === 'path' && node.points && node.points[index]) {
+          const p = node.points[index];
+          const isSmooth = p.lcx !== undefined || p.rcx !== undefined;
+          setPenPointMode(isSmooth ? 'smooth' : 'corner');
+      }
+  };
+
+  const convertAnchorType = (mode: 'corner' | 'smooth') => {
+      if (!activePathAnchor) return;
+      const { nodeId, index } = activePathAnchor;
+      setNodes(prev => prev.map(n => {
+          if (n.id !== nodeId || n.type !== 'path' || !n.points || !n.points[index]) return n;
+          const isClosed = n.closed !== false && n.points.length > 1;
+          const points = [...n.points];
+          const p = { ...points[index] };
+
+          if (mode === 'corner') {
+              delete p.lcx; delete p.lcy; delete p.rcx; delete p.rcy;
+          } else {
+              Object.assign(p, buildSmoothHandles(points, index, isClosed));
+          }
+
+          points[index] = p;
+          return { ...n, points };
+      }));
+  };
+
+  const handlePenModeChange = (mode: 'corner' | 'smooth') => {
+      setPenPointMode(mode);
+      // If currently selecting an anchor, also convert it immediately to match the chosen mode
+      if (activePathAnchor) {
+          convertAnchorType(mode);
+      }
+  };
+
+  const handleNodeDoubleClick = (nodeId: string) => {
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      setSelectedNodeIds([nodeId]);
+      setEditingNodeId(nodeId);
+
+      if (node.type === 'path') {
+          setActiveTool('pen');
+          setEditingPathId(nodeId);
+          if (node.points && node.points.length > 0) {
+              setActivePathAnchor({ nodeId, index: 0 });
+          }
+      } else {
+          // Non-path shapes: stay in select mode for editing/resizing only
+          setActiveTool('select');
+      }
+  };
+
+  const handleResizeNode = (id: string, width: number, height: number) => {
+    if (!resizeState) { 
+        setNodes(prev => prev.map(n => n.id === id ? { ...n, width, height } : n));
+    }
+  };
+
+  const handleUploadImage = () => fileInputRef.current?.click();
+
+  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(e.target.files || []);
+      if (files.length === 0) return;
+
+      const centerWorld = screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+      const maxDim = 320;
+
+      files.forEach((file) => {
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+              const dataUrl = ev.target?.result as string | null;
+              if (!dataUrl) return;
+
+              const img = new Image();
+              img.onload = () => {
+                  let w = img.width;
+                  let h = img.height;
+                  if (w > h && w > maxDim) {
+                      h = Math.round((h / w) * maxDim);
+                      w = maxDim;
+                  } else if (h >= w && h > maxDim) {
+                      w = Math.round((w / h) * maxDim);
+                      h = maxDim;
+                  }
+                  setPendingImages(prev => [...prev, { src: dataUrl, width: w, height: h }]);
+                  setPendingImagePos(pos => pos || centerWorld);
+                  setActiveTool('select');
+              };
+              img.src = dataUrl;
+          };
+          reader.readAsDataURL(file);
+      });
+
+      // Reset input so the same file can be uploaded again
+      e.target.value = '';
+  };
+
+  const handleLayerSelect = (id: string, multi: boolean) => {
+      if (multi) {
+          if (selectedNodeIds.includes(id)) {
+              setSelectedNodeIds(prev => prev.filter(nid => nid !== id));
+          } else {
+              setSelectedNodeIds(prev => [...prev, id]);
+          }
+      } else {
+          setSelectedNodeIds([id]);
+      }
+  };
+
+  // Logic for toolbars: Use the LAST selected node as the "Primary" for reading values
+  const primarySelectedNode = selectedNodeIds.length > 0 ? nodes.find(n => n.id === selectedNodeIds[selectedNodeIds.length - 1]) : null;
+  const primaryNodeScreenPos = primarySelectedNode ? worldToScreen(primarySelectedNode.x, primarySelectedNode.y) : null;
+  const selectedNodes = React.useMemo(() => nodes.filter(n => selectedNodeIds.includes(n.id)), [nodes, selectedNodeIds]);
+  const selectionBounds = React.useMemo(() => {
+      if (selectedNodes.length === 0) return null;
+      const minX = Math.min(...selectedNodes.map(n => n.x));
+      const maxX = Math.max(...selectedNodes.map(n => n.x + n.width));
+      const minY = Math.min(...selectedNodes.map(n => n.y));
+      const maxY = Math.max(...selectedNodes.map(n => n.y + n.height));
+      const topLeft = worldToScreen(minX, minY);
+      const bottomRight = worldToScreen(maxX, maxY);
+      return {
+          left: topLeft.x,
+          top: topLeft.y,
+          width: bottomRight.x - topLeft.x,
+          height: bottomRight.y - topLeft.y,
+          world: { minX, maxX, minY, maxY }
+      };
+  }, [selectedNodes, worldToScreen]);
+  const selectionGroupId = React.useMemo(() => {
+      if (selectedNodes.length === 0) return null;
+      const gid = selectedNodes[0].groupId;
+      if (!gid) return null;
+      return selectedNodes.every(n => n.groupId === gid) ? gid : null;
+  }, [selectedNodes]);
+  const showAlign = selectedNodeIds.length >= 2;
+  const showDistribute = selectedNodeIds.length >= 3;
+  const singleImageSelected = selectedNodeIds.length === 1 && nodes.find(n => n.id === selectedNodeIds[0])?.type === 'image';
+  
+  const activeAnchorPosition = (() => {
+      if (!activePathAnchor) return null;
+      const node = nodes.find(n => n.id === activePathAnchor.nodeId && n.type === 'path');
+      if (!node || !node.points || !node.points[activePathAnchor.index]) return null;
+      const p = node.points[activePathAnchor.index];
+      const worldX = node.x + (p.x * node.width);
+      const worldY = node.y + (p.y * node.height);
+      return worldToScreen(worldX, worldY);
+  })();
+
+  const layoutShiftStyle = { left: isLayersOpen ? `${SIDEBAR_WIDTH + 16}px` : '16px', transition: 'left 0.3s ease-in-out' };
+
+  // Calculate Pen Snap State
+  const isSnapToStart = activeTool === 'pen' && penPoints.length > 2 && currentPointerPos && Math.sqrt(Math.pow(currentPointerPos.x - penPoints[0].x, 2) + Math.pow(currentPointerPos.y - penPoints[0].y, 2)) < (10 / view.scale);
+
+  // Generate SVG Path String for Preview
+  const getPenPreviewPath = () => {
+      if (penPoints.length === 0) return '';
+      let d = `M ${penPoints[0].x} ${penPoints[0].y} `;
+      for (let i = 1; i < penPoints.length; i++) {
+          const prev = penPoints[i-1];
+          const curr = penPoints[i];
+          if (prev.rcx !== undefined && curr.lcx !== undefined) {
+             d += `C ${prev.x + prev.rcx} ${prev.y + prev.rcy}, ${curr.x + curr.lcx} ${curr.y + curr.lcy}, ${curr.x} ${curr.y} `;
+          } else {
+             d += `L ${curr.x} ${curr.y} `;
+          }
+      }
+      // Rubber band line to mouse
+      if (currentPointerPos && !isPenDragging) {
+         d += `L ${currentPointerPos.x} ${currentPointerPos.y}`;
+      }
+      return d;
+  };
+
+  return (
+    <div 
+      className="w-full h-screen bg-white relative overflow-hidden select-none font-sans"
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerUp}
+      onPointerMove={handlePointerMove}
+    >
+      <input type="file" ref={fileInputRef} onChange={handleImageChange} accept="image/*" multiple className="hidden" />
+
+      <LayersPanel 
+        nodes={nodes} selectedNodeIds={selectedNodeIds} onSelectNode={handleLayerSelect}
+        isOpen={isLayersOpen} onClose={() => setIsLayersOpen(false)}
+      />
+
+      <div className="fixed top-4 z-50 flex items-center bg-white rounded-full p-1 pl-1 pr-4 shadow-[0_2px_8px_rgba(0,0,0,0.06)] border border-gray-100 transition-all duration-300" style={layoutShiftStyle}>
+        <div className="bg-slate-900 text-white p-2 rounded-full mr-3"><IconGrid className="w-4 h-4" /></div>
+        <input value={boardName} onChange={(e) => setBoardName(e.target.value)} className="font-semibold text-slate-700 outline-none bg-transparent placeholder-slate-400 min-w-[100px]" />
+      </div>
+      {selectionBounds && (
+        <div
+          className="fixed z-[190] bg-white shadow-[0_10px_40px_rgba(0,0,0,0.12)] border border-gray-100 rounded-2xl px-4 py-2 flex items-center gap-3"
+          style={{
+            left: selectionBounds.left + selectionBounds.width / 2,
+            top: Math.max(16, selectionBounds.top - 80),
+            transform: "translateX(-50%)"
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {(selectedNodeIds.length >= 2 && !selectionGroupId) && (
+            <button className="flex items-center gap-1 px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-medium text-slate-700" onClick={handleGroup}>
+              <span className="text-lg">[G]</span><span>{"创建编组"}</span>
+            </button>
+          )}
+          {selectionGroupId && (
+            <button className="flex items-center gap-1 px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-medium text-slate-700" onClick={handleUngroup}>
+              <span className="text-lg">X</span><span>{"取消编组"}</span>
+            </button>
+          )}
+          {(showAlign || showDistribute) && <div className="w-px h-5 bg-gray-200" />}
+          {showAlign && (
+            <div className="relative">
+              <button
+                className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100"
+                onClick={() => {
+                  setAlignMenuOpen(v => !v);
+                  setSpacingMenuOpen(false);
+                }}
+              >
+                <span className="text-lg">||</span><span>{"对齐"}</span>
+              </button>
+              {alignMenuOpen && (
+                <div className="absolute top-12 left-0 bg-white shadow-xl rounded-xl border border-gray-100 py-2 w-44 z-10">
+                  {[
+                    { label: "左对齐", fn: () => alignNodes('left') },
+                    { label: "水平居中", fn: () => alignNodes('centerX') },
+                    { label: "右对齐", fn: () => alignNodes('right') },
+                    { label: "顶部对齐", fn: () => alignNodes('top') },
+                    { label: "垂直居中", fn: () => alignNodes('centerY') },
+                    { label: "底部对齐", fn: () => alignNodes('bottom') },
+                  ].map(item => (
+                    <button key={item.label} className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 text-slate-700" onClick={() => { item.fn(); setAlignMenuOpen(false); }}>
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {showDistribute && (
+            <div className="relative">
+              <button
+                className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100"
+                onClick={() => {
+                  setSpacingMenuOpen(v => !v);
+                  setAlignMenuOpen(false);
+                }}
+              >
+                <span className="text-lg">...</span><span>{"分布"}</span>
+              </button>
+              {spacingMenuOpen && (
+                <div className="absolute top-12 left-0 bg-white shadow-xl rounded-xl border border-gray-100 py-2 w-48 z-10">
+                  <button className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 text-slate-700" onClick={() => { distribute('x'); setSpacingMenuOpen(false); }}>{"水平间距"}</button>
+                  <button className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 text-slate-700" onClick={() => { distribute('y'); setSpacingMenuOpen(false); }}>{"垂直间距"}</button>
+                </div>
+              )}
+            </div>
+          )}
+          {(showAlign || showDistribute) && <div className="w-px h-5 bg-gray-200" />}
+          {selectedNodeIds.length > 0 && (
+            <>
+              <button className="flex items-center gap-1 px-2 py-2 rounded-lg hover:bg-slate-100 text-sm font-medium text-slate-700" onClick={bringToFront}>
+                <span className="text-lg">^</span><span>{"置顶"}</span>
+              </button>
+              <button className="flex items-center gap-1 px-2 py-2 rounded-lg hover:bg-slate-100 text-sm font-medium text-slate-700" onClick={sendToBack}>
+                <span className="text-lg">v</span><span>{"置底"}</span>
+              </button>
+            </>
+          )}
+          <div className="w-px h-5 bg-gray-200" />
+          {singleImageSelected && (
+            <button className="flex items-center gap-1 px-3 py-2 rounded-lg hover:bg-slate-100 text-sm font-medium text-slate-700" onClick={toggleCropSelectedImage}>
+              <span className="text-lg">Cut</span><span>{"裁剪"}</span>
+            </button>
+          )}
+        </div>
+      )}
+      <div
+        ref={canvasRef}
+        className={`w-full h-full absolute inset-0 ${isPanning ? 'cursor-grab active:cursor-grabbing' : (activeTool === 'pen' || pendingImages.length > 0) ? 'cursor-crosshair' : ''}`}
+        onPointerDown={handlePointerDown}
+        onWheel={(e) => {
+            if (e.ctrlKey || e.metaKey) {
+              e.preventDefault();
+              const zoomSensitivity = 0.001;
+              const delta = -e.deltaY * zoomSensitivity;
+              const newScale = Math.min(Math.max(view.scale * (1 + delta), MIN_SCALE), MAX_SCALE);
+              const cursorWorld = screenToWorld(e.clientX, e.clientY);
+              setView({ scale: newScale, offsetX: e.clientX - cursorWorld.x * newScale, offsetY: e.clientY - cursorWorld.y * newScale });
+            } else {
+              setView(prev => ({ ...prev, offsetX: prev.offsetX - e.deltaX, offsetY: prev.offsetY - e.deltaY }));
+            }
+        }}
+        style={{ backgroundColor: '#ffffff' }}
+      >
+        <div style={{ transform: `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`, transformOrigin: '0 0', position: 'absolute' }}>
+          {selectionBox && (
+              <SelectionBox rect={selectionBox} />
+          )}
+          
+          {nodes.map(node => (
+            <Node
+              key={node.id}
+              node={node}
+              isSelected={selectedNodeIds.includes(node.id)}
+              scale={view.scale}
+              onMouseDown={(e) => handleNodePointerDown(e, node.id)}
+              onChange={updateNodeContent}
+              onResize={handleResizeNode}
+              onResizeStart={(e, handle) => handleResizeStart(e, handle, node.id)}
+              onUpdateNode={updateNodePoints}
+              activeTool={activeTool}
+              penPointMode={penPointMode}
+              forcePathEdit={editingPathId === node.id}
+              onSelectAnchor={handleSelectAnchor}
+              onDoubleClick={() => handleNodeDoubleClick(node.id)}
+              isCroppingImage={croppingImageId === node.id}
+            />
+          ))}
+
+          {/* Render Active Pen Path */}
+          {activeTool === 'pen' && penPoints.length > 0 && (
+              <svg className="absolute top-0 left-0 overflow-visible pointer-events-none" style={{ zIndex: 100 }}>
+                <path 
+                    d={getPenPreviewPath()}
+                    fill="none"
+                    stroke="#3b82f6"
+                    strokeWidth="2"
+                />
+                {penPoints.map((p, i) => (
+                    <g key={i}>
+                        {/* Anchor */}
+                        <circle cx={p.x} cy={p.y} r={3/view.scale} fill="#fff" stroke="#3b82f6" strokeWidth={1/view.scale} />
+                        {/* Handles (Visual feedback while drawing) */}
+                        {p.rcx && (
+                            <>
+                                <line x1={p.x} y1={p.y} x2={p.x+p.rcx} y2={p.y+p.rcy} stroke="#3b82f6" strokeWidth={1/view.scale} opacity="0.5" />
+                                <circle cx={p.x+p.rcx} cy={p.y+p.rcy} r={2/view.scale} fill="#3b82f6" />
+                            </>
+                        )}
+                        {p.lcx && (
+                            <>
+                                <line x1={p.x} y1={p.y} x2={p.x+p.lcx} y2={p.y+p.lcy} stroke="#3b82f6" strokeWidth={1/view.scale} opacity="0.5" />
+                                <circle cx={p.x+p.lcx} cy={p.y+p.lcy} r={2/view.scale} fill="#3b82f6" />
+                            </>
+                        )}
+                    </g>
+                ))}
+                {isSnapToStart && (
+                    <circle cx={penPoints[0].x} cy={penPoints[0].y} r={8/view.scale} fill="rgba(59, 130, 246, 0.5)" />
+                )}
+              </svg>
+          )}
+
+        </div>
+      </div>
+
+      {primarySelectedNode && !isDragging && !resizeState && primaryNodeScreenPos && (
+          <>
+            {primarySelectedNode.type === 'text' && (
+                <TextToolbar selectedNode={primarySelectedNode} onUpdateNode={updateNodeStyle} position={primaryNodeScreenPos} />
+            )}
+            {['rectangle', 'circle', 'triangle', 'star', 'diamond', 'hexagon', 'pentagon', 'path'].includes(primarySelectedNode.type) && (
+                <ShapeToolbar selectedNode={primarySelectedNode} onUpdateNode={updateNodeStyle} position={primaryNodeScreenPos} />
+            )}
+          </>
+      )}
+
+      <Toolbar activeTool={activeTool} onSelectTool={setActiveTool} onUploadImage={handleUploadImage} snapEnabled={snapEnabled} onToggleSnap={() => setSnapEnabled(prev => !prev)} style={layoutShiftStyle} />
+
+      <PenToolbar 
+        visible={activeTool === 'pen' && (!!editingPathId || penPoints.length > 0 || !!activePathAnchor)}
+        mode={penPointMode}
+        onModeChange={handlePenModeChange}
+        onCorner={() => convertAnchorType('corner')}
+        onSmooth={() => convertAnchorType('smooth')}
+        anchorPosition={activeAnchorPosition}
+        hasActiveAnchor={!!activePathAnchor}
+      />
+
+      {pendingImages.length > 0 && pendingImagePos && (() => {
+          const count = pendingImages.length;
+          const cols = Math.ceil(Math.sqrt(count));
+          const rows = Math.ceil(count / cols);
+          const colWidths = Array(cols).fill(0);
+          const rowHeights = Array(rows).fill(0);
+          pendingImages.forEach((img, idx) => {
+              const r = Math.floor(idx / cols);
+              const c = idx % cols;
+              colWidths[c] = Math.max(colWidths[c], img.width);
+              rowHeights[r] = Math.max(rowHeights[r], img.height);
+          });
+          const totalWidth = colWidths.reduce((a, w) => a + w, 0) + PENDING_SPACING * (cols - 1);
+          const totalHeight = rowHeights.reduce((a, h) => a + h, 0) + PENDING_SPACING * (rows - 1);
+
+          const origin = findFreeOrigin(pendingImagePos, totalWidth, totalHeight);
+          const screenOrigin = worldToScreen(origin.x, origin.y);
+          const previewW = Math.max(24, totalWidth * view.scale);
+          const previewH = Math.max(24, totalHeight * view.scale);
+          return (
+            <div
+              className="pointer-events-none fixed z-[200] border-2 border-blue-500/80 bg-blue-200/25 rounded-sm transition-transform duration-150 ease-out"
+              style={{
+                  width: previewW,
+                  height: previewH,
+                  left: screenOrigin.x,
+              top: screenOrigin.y,
+              boxShadow: '0 8px 24px rgba(37, 99, 235, 0.15)'
+            }}
+          />
+          );
+      })()}
+
+      {snapGuides.vertical.map((g, idx) => {
+          const start = worldToScreen(g.x, g.y1);
+          const end = worldToScreen(g.x, g.y2);
+          return (
+            <div
+              key={`v-${idx}-${g.x}-${g.y1}-${g.y2}`}
+              className="pointer-events-none fixed z-[180] border-l-2 border-blue-500/80"
+              style={{ left: start.x, top: Math.min(start.y, end.y), height: Math.abs(end.y - start.y) }}
+            />
+          );
+      })}
+      {snapGuides.horizontal.map((g, idx) => {
+          const start = worldToScreen(g.x1, g.y);
+          const end = worldToScreen(g.x2, g.y);
+          return (
+            <div
+              key={`h-${idx}-${g.y}-${g.x1}-${g.x2}`}
+              className="pointer-events-none fixed z-[180] border-t-2 border-blue-500/80"
+              style={{ top: start.y, left: Math.min(start.x, end.x), width: Math.abs(end.x - start.x) }}
+            />
+          );
+      })}
+
+      <div className="fixed bottom-4 z-50 flex items-center bg-white rounded-full shadow-[0_2px_12px_rgba(0,0,0,0.08)] border border-gray-100 p-1 transition-all duration-300" style={layoutShiftStyle}>
+        <button className={`p-2 rounded-full transition-colors ${isLayersOpen ? 'bg-indigo-50 text-indigo-600' : 'hover:bg-slate-50 text-slate-500'}`} onClick={() => setIsLayersOpen(!isLayersOpen)}><IconLayers className="w-4 h-4" /></button>
+        <div className="w-px h-4 bg-gray-200 mx-1"></div>
+        <button className="p-2 hover:bg-slate-50 rounded-full text-slate-600" onClick={() => setView(v => ({ ...v, scale: Math.max(v.scale * 0.8, MIN_SCALE) }))}><IconMinus className="w-3 h-3" /></button>
+        <span className="text-xs font-medium text-slate-600 w-10 text-center">{Math.round(view.scale * 100)}%</span>
+        <button className="p-2 hover:bg-slate-50 rounded-full text-slate-600" onClick={() => setView(v => ({ ...v, scale: Math.min(v.scale * 1.2, MAX_SCALE) }))}><IconPlus className="w-3 h-3" /></button>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
